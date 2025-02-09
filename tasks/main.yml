@@ -1,0 +1,310 @@
+- name: Configure OMI Agent
+
+  hosts: all
+
+  become: yes
+
+  vars:
+
+    ansible_user: gaurav #your username through which you want to login
+
+    ansible_port: 22 #from port you want to login
+
+    sudo_user: root
+
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+
+
+
+  vars_prompt:
+
+    - name: omi_package
+
+      prompt: "Enter the path of OMI package (.tar.gz or .gz)"
+
+      private: no
+
+
+
+  roles:
+
+    - HPOMI_agent_install
+
+      #    - pre_checks
+
+      #- file_operations
+
+      #- installation
+
+      #- verification
+	  
+	  
+# roles/pre_checks/tasks/main.yml
+
+- name: Check if OMI process is already running
+
+  shell: "ps -ef | grep ov | grep -v grep"
+
+  register: omi_process
+
+  changed_when: false
+
+  failed_when: false
+
+
+
+- name: Check if /vg00/list/HPOA filesystem exists
+
+  stat:
+
+    path: /vg00/list/HPOA
+
+  register: fs_check
+
+
+
+- name: Fail if OMI agent is already installed
+
+  fail:
+
+    msg: "OMI agent seems to be installed already. Process or FS exists."
+
+  when: omi_process.stdout != "" or fs_check.stat.exists
+
+
+
+- name: Check available space in /tmp (in bytes)
+
+  shell: "df --output=avail -B1 /tmp | tail -1"
+
+  register: tmp_space
+
+  changed_when: false
+
+
+
+- name: Convert /tmp space to GB
+
+  set_fact:
+
+    tmp_space_gb: "{{ tmp_space.stdout | int // (1024*1024*1024) }}"  # Convert bytes to GB
+
+
+
+- name: Check available space in VG-vg00vg (in MB)
+
+  shell: "vgs --noheadings -o vg_free --units m vg00vg | awk '{print int($1)}'"
+
+  register: vg_space
+
+  changed_when: false
+
+
+
+- name: Debug space values
+
+  debug:
+
+    msg: "Available space - /tmp: {{ tmp_space_gb }}GB, VG-vg00vg: {{ vg_space.stdout }}MB"
+
+
+
+- name: Fail if space requirements are not met
+
+  fail:
+
+    msg: "/tmp or VG-vg00vg does not have sufficient space."
+
+  when:
+
+    - tmp_space_gb | int < 1
+
+    - vg_space.stdout | int < 2000
+
+
+
+# roles/file_operations/tasks/main.yml
+
+- name: Copy OMI package to /tmp
+
+  copy:
+
+    src: "{{ omi_package }}"
+
+    dest: "/tmp/omi_package.tar.gz"
+
+    mode: '0644'
+
+
+
+- name: Create logical volume for /vg00/list/HPOA
+
+  lvol:
+
+    vg: vg00vg
+
+    lv: oa_lv
+
+    size: 2G
+
+    force: yes
+
+
+
+- name: Create XFS filesystem on the new volume
+
+  filesystem:
+
+    fstype: xfs
+
+    dev: /dev/vg00vg/oa_lv
+
+
+
+- name: Mount /vg00/list/HPOA and ensure persistence
+
+  mount:
+
+    path: /vg00/list/HPOA
+
+    src: /dev/vg00vg/oa_lv
+
+    fstype: xfs
+
+    state: mounted
+
+
+
+- name: Copy and extract OMI package to /vg00/list/HPOA
+
+  unarchive:
+
+    src: "/tmp/omi_package.tar.gz"
+
+    dest: "/vg00/list/HPOA"
+
+    remote_src: yes
+
+
+
+# roles/installation/tasks/main.yml
+
+- name: Find the correct install.sh location
+
+  find:
+
+    paths: "/vg00/list/HPOA"
+
+    patterns: "install.sh"
+
+    file_type: file
+
+  register: install_script
+
+
+
+- name: Ensure install.sh is found
+
+  fail:
+
+    msg: "install.sh was not found in /vg00/list/HPOA"
+
+  when: install_script.matched == 0
+
+
+
+- name: Set the install directory fact
+
+  set_fact:
+
+    install_directory: "{{ install_script.files[0].path | dirname }}"
+
+
+
+- name: Change ownership and permissions of extracted files
+
+  file:
+
+    path: "{{ install_directory }}"
+
+    owner: gaurav  #your owner of the filesystem
+
+    group: gaurav
+
+    mode: '0755'
+
+    recurse: yes
+
+
+
+- name: Set root ownership for install scripts
+
+  file:
+
+    path: "{{ install_directory }}/{{ item }}"
+
+    owner: root
+
+    group: root
+
+  loop:
+
+    - install.sh
+
+
+
+- name: Run install script from the correct location
+
+  command:
+
+    cmd: ./install.sh
+
+  args:
+
+    chdir: "{{ install_directory }}"
+
+  register: install_output
+
+  changed_when: install_output.rc == 0
+
+
+
+- name: Debug installation output
+
+  debug:
+
+    var: install_output.stdout_lines
+
+
+
+
+
+# roles/verification/tasks/main.yml
+
+- name: Confirm OMI process is running
+
+  shell: "ps -ef | grep ov | grep -v grep"
+
+  register: omi_status
+
+  changed_when: false
+
+
+
+- name: Display installation result
+
+  debug:
+
+    msg: "Installation successful. OMI process is running."
+
+  when: omi_status.stdout != ""
+
+
+
+- name: Fail if OMI process is not running
+
+  fail:
+
+    msg: "Installation failed. OMI process is not running."
+
+  when: omi_status.stdout == ""
